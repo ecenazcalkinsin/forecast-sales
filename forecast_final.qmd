@@ -1,0 +1,223 @@
+---
+title: "forecast_final"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(magrittr)
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(pander)
+library(tsibble)
+library(feasts)
+library(fable)
+library(fabletools)
+library(DBI)
+library(RSQLite)
+library(readxl)
+library(dbplyr)
+```
+
+# Read sales data from SQL
+
+```{r}
+db_path <- "/Users/ecenazcalkinsin/Desktop/IE477-78/Data/makineler.db"
+con <- dbConnect(RSQLite::SQLite(), db_path)
+machine <-'SBX IST OTG OPET KMO KUZEYMARMARA-1'
+query <- sprintf("SELECT *, CAST(article AS TEXT) AS article FROM all_transaction_log WHERE machine = '%s'", machine)
+d1 <- dbGetQuery(con, query)
+dbDisconnect(con)
+```
+
+#Read recipe from SQL
+
+```{r}
+con <- dbConnect(RSQLite::SQLite(), db_path)
+query <- "SELECT * FROM recipe"
+recipe <- dbGetQuery(con, query)
+dbDisconnect(con)
+
+recipe_df_long <- recipe %>%        # convert to long format (one column for the ingredient names)
+  pivot_longer(cols = -`ProductName`, names_to = "ingredient", values_to = "amount")
+```
+
+```{r}
+last_day <- as.POSIXct("2023-12-1") # cut-off date
+sales_df <- d1 %>% bind_rows() %>% 
+  filter(date <= last_day) 
+  # mutate(across(where(is.character), factor)) 
+sales_df$product_name <- gsub("CaffÃ¨", "Coffee", sales_df$product_name)
+sales_df %>% tail()
+```
+
+# Find hourly ingredient consumption
+
+```{r}
+sales_df$date <- as.POSIXct(sales_df$date, tz = "UTC")
+
+sales_df_hourly <- sales_df %>% 
+  mutate(date_hour = floor_date(date, "hour")) %>% # Truncate to hour
+  group_by(date_hour, machine, product_name) %>%
+  summarise(TotalCoffeeSales = sum(quantity), .groups = "drop")
+```
+
+```{r}
+ingredients_ts <- sales_df_hourly %>% 
+  left_join(recipe_df_long, by = c("product_name" = "ProductName")) %>% 
+  filter(!is.na(ingredient)) %>%
+  group_by(date_hour, machine, ingredient) %>% 
+  summarize(amount = sum(TotalCoffeeSales*amount), .groups = "drop") %>% 
+  as_tsibble(key = c(machine, ingredient), index = date_hour) %>% 
+  fill_gaps() %>% 
+  replace_na(list(amount = 0))
+
+ingredients_ts %>% head()
+```
+
+```{r}
+#| fig.asp: 1
+ingredients_ts %>% 
+  autoplot(amount) +
+  facet_grid(ingredient ~ machine, scales = "free_y") +
+  theme(strip.text.y = element_text(angle=0), legend.position = "none")
+```
+
+```{r}
+#| fig.asp: 1
+ingredients_ts %>% 
+  # filter_index(. ~ "2023-06-31") %>% 
+  # filter_index("2023-04-30" ~ "2023-06-30") %>% 
+  gg_season(amount, period = "day") +
+  facet_grid(ingredient ~ machine, scales = "free_y") +
+  theme(strip.text.y = element_text(angle=0))
+```
+
+# Models
+
+```{r}
+dcmp_dwm <- decomposition_model(
+  STL(sqrt(amount) ~ season(period = 24) +
+                     season(period = 7*24) +
+                     season(period= 7*24*4),
+      robust = TRUE),
+  ETS(season_adjust ~ season("N"))
+)
+
+dcmp_dm <- decomposition_model(
+  STL(sqrt(amount) ~ season(period = 24) +
+                     season(period= 7*24*4),
+      robust = TRUE),
+  ETS(season_adjust ~ season("N"))
+)
+
+dcmp_d <- decomposition_model(
+  STL(sqrt(amount) ~ season(period = 24),
+      robust = TRUE),
+  ETS(season_adjust ~ season("N"))
+)
+```
+
+# Train and test
+
+```{r}
+ingredients_ts_train <- ingredients_ts %>% 
+  filter_index(. ~ "2023-10-31")
+
+ingredients_ts_test <- ingredients_ts %>% 
+  filter_index("2023-11-1" ~ .)
+
+ingredients_mable_train <- ingredients_ts_train %>% 
+    model(dcmp_dwm = dcmp_dwm,
+          dcmp_dm = dcmp_dm,
+          dcmp_d = dcmp_d)
+
+ingredients_fable_test <- ingredients_mable_train %>% 
+  forecast(h = "2 days", simulate = TRUE)
+
+bind_rows(
+  accuracy(ingredients_mable_train),
+  accuracy(ingredients_fable_test, ingredients_ts)
+) %>% 
+  arrange(desc(.type), .model) %>% select(-.type, -MPE, -ACF1, -MAPE) %>%   filter(ingredient %in% c("0", "1", "2"))
+
+```
+
+#Select the lowest MASE
+
+```{r}
+a <- bind_rows(
+  accuracy(ingredients_mable_train),
+  accuracy(ingredients_fable_test, ingredients_ts)
+) %>% 
+  arrange(desc(.type), .model)
+
+
+best_models <- a %>%
+  filter(!is.na(MASE)) %>%
+  group_by(ingredient) %>%
+  filter(MASE == min(MASE, na.rm = TRUE)) %>%
+  select(ingredient, .model)
+
+
+forecast_result <- ingredients_fable_test %>%
+  semi_join(best_models, by = c("ingredient", ".model"))
+
+
+```
+
+# Import to SQL
+
+```{r}
+forecast_df <- as.data.frame(forecast_result) %>%
+                select(date_hour, machine, ingredient, .mean) %>%
+                mutate(.mean = round(.mean, 0))
+
+
+forecast_df$date_hour <- strftime(forecast_df$date_hour, format = "%Y-%m-%d %H:%M:%S")
+db_path <- "/Users/ecenazcalkinsin/Desktop/IE477-78/Data/makineler.db"
+con <- dbConnect(RSQLite::SQLite(), db_path)
+dbWriteTable(con, "FORECAST", forecast_df, rowNames = FALSE, append = TRUE)
+dbDisconnect(con)
+```
+
+## Draw the graph
+
+```{r,fig.width=10, fig.asp=1,warning=FALSE}
+
+ingredients_ts_train %>% 
+slice_tail(n = 2*24, by = c(machine, ingredient)) %>% 
+autoplot(amount) +
+autolayer(ingredients_fable_test, level = 80) +  
+autolayer(ingredients_ts_test %>% slice_head(n = 2*24, by = c(machine, ingredient)), amount) +
+theme(strip.text.y = element_text(angle=0), legend.position = "none") +
+facet_grid(ingredient ~ .model, scales = "free_y") +   
+labs(title = "Consumption amounts")
+```
+
+# Hourly distributions of daily consumptions
+
+```{r}
+trf <- ingredients_ts %>% 
+  as_tibble() %>% 
+  mutate(h = hour(date_hour),
+         hf = factor(h),
+         hf = fct_inseq(hf),
+         date = as.Date(date_hour),
+         wday = lubridate::wday(date_hour, lab = TRUE, week_start = 1)) %>% 
+  group_by(date) %>% 
+  group_by(ingredient) %>% 
+  mutate(amount = amount/sum(amount))
+
+trf %>% 
+  ggplot(aes(h, amount, group = date)) +
+  geom_line() +
+  facet_grid(ingredient ~ machine, scales = "free_y")
+
+trf %>% 
+  ggplot(aes(hf, amount)) +
+  geom_boxplot() +
+  facet_grid(ingredient ~ machine, scales = "free_y")
+```
